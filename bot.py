@@ -5,11 +5,13 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import speech_recognition as sr
 
 load_dotenv()
 
@@ -108,6 +110,31 @@ async def call_claude_async(prompt: str, chat_id: int) -> str:
     return await loop.run_in_executor(None, call_claude, prompt, chat_id)
 
 
+def transcribe_voice(ogg_path: str) -> str:
+    """Convert OGG voice memo to text using speech recognition."""
+    wav_path = ogg_path.replace(".ogg", ".wav")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path, "-y"],
+            capture_output=True, timeout=30,
+        )
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+        return recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return None
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return None
+    finally:
+        for f in (ogg_path, wav_path):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
 def chunk_message(text: str) -> list[str]:
     if len(text) <= MAX_MESSAGE_LENGTH:
         return [text]
@@ -136,7 +163,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Hello! I'm your remote Claude Code assistant.\n\n"
         "I have full access to your PC — files, terminal, web search, "
         "Google Calendar, and all MCP tools.\n\n"
-        "I remember our conversation until you reset it.\n\n"
+        "Send me text or voice messages. I remember our conversation "
+        "until you reset it.\n\n"
         "Commands:\n"
         "/start - This message\n"
         "/reset - Clear conversation memory\n"
@@ -154,7 +182,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- Run terminal commands (git, python, npm, etc.)\n"
         "- Search the web\n"
         "- Access Google Calendar, Telegram, Playwright\n"
-        "- Multi-step coding tasks\n\n"
+        "- Multi-step coding tasks\n"
+        "- Voice messages (auto-transcribed)\n\n"
         "I remember our conversation. Use /reset to start fresh."
     )
 
@@ -166,18 +195,9 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Conversation reset. Next message starts a fresh session.")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_allowed(user_id):
-        await update.message.reply_text("Not authorized.")
-        return
-
-    user_message = update.message.text
-    if not user_message:
-        return
-
+async def send_to_claude(update: Update, prompt: str) -> None:
+    """Send a prompt to Claude with typing indicator and chunked response."""
     chat_id = update.effective_chat.id
-    logger.info(f"Message from {update.effective_user.username} ({user_id}): {user_message[:100]}")
 
     await update.message.chat.send_action("typing")
 
@@ -194,7 +214,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     typing_task = asyncio.create_task(keep_typing())
 
     try:
-        response = await call_claude_async(user_message, chat_id)
+        response = await call_claude_async(prompt, chat_id)
     finally:
         stop_typing.set()
         typing_task.cancel()
@@ -205,6 +225,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.error(f"Failed to send chunk: {e}")
             await update.message.reply_text("(Error sending part of the response)")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    user_message = update.message.text
+    if not user_message:
+        return
+
+    logger.info(f"Message from {update.effective_user.username} ({user_id}): {user_message[:100]}")
+    await send_to_claude(update, user_message)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    logger.info(f"Voice from {update.effective_user.username} ({user_id})")
+
+    # Download voice file
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{uuid.uuid4().hex}.ogg")
+    await file.download_to_drive(ogg_path)
+
+    # Transcribe
+    await update.message.chat.send_action("typing")
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, transcribe_voice, ogg_path)
+
+    if not text:
+        await update.message.reply_text("Could not transcribe the voice message. Please try again or type your message.")
+        return
+
+    logger.info(f"Transcribed: {text[:100]}")
+    await update.message.reply_text(f"[Voice] {text}")
+    await send_to_claude(update, text)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -218,6 +280,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot starting with working dir: {WORKING_DIR}")
